@@ -3,9 +3,12 @@ import * as resources from '@pulumi/azure-native/resources'
 import * as containerregistry from '@pulumi/azure-native/containerregistry'
 import * as dockerBuild from '@pulumi/docker-build'
 import * as containerinstance from '@pulumi/azure-native/containerinstance'
+import * as redis from '@pulumi/azure-native/redis'
 
 // Import the configuration settings for the current stack.
 const config = new pulumi.Config()
+const azureConfig = new pulumi.Config('azure-native')
+const location = azureConfig.require('location')
 const appPath = config.require('appPath')
 const prefixName = config.require('prefixName')
 const imageName = prefixName
@@ -19,13 +22,45 @@ const cpu = config.requireNumber('cpu')
 const memory = config.requireNumber('memory')
 
 // Create a resource group.
-const resourceGroup = new resources.ResourceGroup(`${prefixName}-rg`)
+const resourceGroup = new resources.ResourceGroup(`${prefixName}-rg`, {
+  location: location,
+})
+
+// Create Azure Cache for Redis.
+// Redis is used as an external cache instead of storing weather results only in container memory.
+const redisCacheName = `${prefixName}-redis`
+
+const redisCache = new redis.Redis(redisCacheName, {
+  name: redisCacheName,
+  resourceGroupName: resourceGroup.name,
+  location: location,
+  enableNonSslPort: false,
+  minimumTlsVersion: '1.2',
+  sku: {
+    name: redis.SkuName.Basic,
+    family: redis.SkuFamily.C,
+    capacity: 0,
+  },
+})
+
+// Get the Redis access key for the container.
+const redisKeys = redis.listRedisKeysOutput({
+  name: redisCache.name,
+  resourceGroupName: resourceGroup.name,
+})
+
+// Build the Redis connection string.
+// rediss:// means Redis over TLS/SSL. Azure Cache for Redis uses port 6380 for SSL.
+const redisUrl = pulumi.secret(
+  pulumi.interpolate`rediss://:${redisKeys.primaryKey}@${redisCache.hostName}:6380`,
+)
 
 // Create the container registry.
 // ACR names cannot contain hyphens, so remove them from prefixName.
 const acrName = prefixName.replace(/-/g, '') + 'acr'
 const registry = new containerregistry.Registry(acrName, {
   resourceGroupName: resourceGroup.name,
+  location: location,
   adminUserEnabled: true,
   sku: {
     name: containerregistry.SkuName.Basic,
@@ -51,7 +86,7 @@ const image = new dockerBuild.Image(`${prefixName}-image`, {
   context: { location: appPath },
   dockerfile: { location: `${appPath}/Dockerfile` },
   target: 'production',
-  platforms: ['linux/amd64', 'linux/arm64'],
+  platforms: ['linux/amd64'],
   push: true,
   registries: [
     {
@@ -62,7 +97,7 @@ const image = new dockerBuild.Image(`${prefixName}-image`, {
   ],
 })
 
-// Create a container group in the Azure Container App service and make it publicly accessible.
+// Create a container group in Azure Container Instances and make it publicly accessible.
 const containerGroup = new containerinstance.ContainerGroup(
   `${prefixName}-container-group`,
   {
@@ -93,7 +128,11 @@ const containerGroup = new containerinstance.ContainerGroup(
           },
           {
             name: 'WEATHER_API_KEY',
-            value: '5c6eb4d5b272580666ef9b8cf726dd31',
+            secureValue: config.requireSecret('weatherApiKey'),
+          },
+          {
+            name: 'REDIS_URL',
+            secureValue: redisUrl,
           },
         ],
         resources: {
@@ -123,3 +162,4 @@ export const ip = containerGroup.ipAddress.apply((addr) => addr!.ip!)
 export const url = containerGroup.ipAddress.apply(
   (addr) => `http://${addr!.fqdn!}:${containerPort}`,
 )
+export const redisHostName = redisCache.hostName

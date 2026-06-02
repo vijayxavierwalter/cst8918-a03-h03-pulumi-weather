@@ -1,262 +1,280 @@
-CST8918 - DevOps: Infrastructure as Code
-Prof: Robert McKenney
+# Hybrid H03 – Pulumi Secrets and Redis Deployment Notes
 
-# Hybrid-H03 Pulumi Weather App (continued)
+## Group 5 Members
+- Ilyas Zazai 
+- Vijay Walter
 
-This is a continuation of the practical lab scenario from Lab-a03. As a reminder, here are the scenario objectives.
 
-## Objectives
+## Purpose of Hybrid H03
 
-### Part One (Lab-A03)
+Hybrid H03 continues from Lab A03. In Lab A03, the weather application was deployed to Azure using Pulumi, Docker, Azure Container Registry, and Azure Container Instances.
 
-- Use Pulumi to provision the IaC resources
-  - Azure Container Registry (ACR)
-  - Azure Container Instances (ACI)
-- Use Pulumi to package the application into a Docker container and deploy it
+Hybrid H03 improves the deployment by adding two important DevOps and cloud features:
 
-### Part Two (Hybrid-H03)
+1. Secure secret handling using Pulumi secrets.
+2. Redis caching using Azure Cache for Redis.
 
-- Add proper secret handling for the OpenWeather API key
-- Modify the application code to utilize a shared Redis instance
-- Update the Pulumi config to provision additional IaC resources
-  - Azure Cache for Redis
-- Update the container image version and redeploy with Pulumi
+The main goal is to make the application closer to a real cloud deployment by removing the hardcoded OpenWeather API key and using an external cache service instead of only using local memory inside the application container.
 
-### Starter Repo
+---
 
-You should proceed from where you left off at the end of Lab-A03. Merge your code from the `lab-a03` branch back into the `main` branch and then create a new branch called `hybrid-h03` based from `main`. All of the work for this assignment should be done in this new branch.
+## Branch Used
 
-## Part Two (H03) - Encrypt secrets and modify the application to use Redis
+This work was completed in the `hybrid-h03` branch.
 
-### OpenWeather API secret key
+The branch workflow was:
 
-Hopefully, leaving your OpenWeather API key unencrypted in the infrastructure code left you with a really icky feeling. It should! And if we really went to production with that, somebody is likely getting fired. Fortunately for us, that was just a temporary checkpoint in completing our solution. Let's look at how to properly handle this and other sensitive configuration items.
-
-We saw in Lab-A01 that with Kubernetes we could use the control plane's `etcd` storage to encrypt/decrypt secrets. This project's solution is not using Kubernetes, so what are the options?
-
-1. Azure **Key Vault** managed service
-2. Pulumi **ESC** (Environments, Secrets, and Configuration) managed service
-3. Pulumi config command
-
-In a larger and more complicated solution design, you will likely want to use either option 1 or option 2. However, for our purposes in this project, option 3 will serve nicely. It works very similarly to the Kubernetes solution. In the terminal (in the _infrastructure_ folder) run the `pulumi config set` command with the `--secret` option. [See the docs for more details](https://www.pulumi.com/docs/cli/commands/pulumi_config_set/).
-
-```sh
-pulumi config set weatherApiKey <your-secret-key> --secret
+```text
+main
+└── hybrid-h03
 ```
 
-> [!IMPORTANT]  
-> Of course replace \<your-secret-key\> with your real OpenWeather API key.
+The `hybrid-h03` branch was created after Lab A03 was completed. This keeps Part One and Part Two separate while still using the same group repository.
 
-To access this secret in the IaC program file (infrastructure/index.ts), modify the environment variables section of the container definition to replace your plain text API key with the config value ...
+---
+
+## Secret Handling with Pulumi
+
+In Lab A03, the OpenWeather API key was placed directly inside the Pulumi infrastructure code as an environment variable.
+
+That approach works for a basic lab, but it is not secure for real DevOps work because secrets should not be hardcoded in source code or pushed to GitHub.
+
+For Hybrid H03, the API key was moved into Pulumi secret configuration:
+
+```bash
+pulumi config set weatherApiKey "<api-key>" --secret
+```
+
+Then the Pulumi infrastructure code was updated to read the secret securely:
 
 ```ts
-          {
-            name: 'WEATHER_API_KEY',
-            value: config.requireSecret('weatherApiKey')
-          }
+secureValue: config.requireSecret('weatherApiKey')
 ```
 
-The config object has two methods that will return the unwrapped secret value: `getSecret` and `requireSecret`. By using the require variant, Pulumi will throw an error if the `weatherApiKey` is not set. Also notice that the unwrapped secret is not stored in a local variable like we did with other config values. Consuming it directly where it is needed helps to prevent accidentally exposing the secret.
+This means Pulumi stores the API key as an encrypted secret and passes it to the Azure container during deployment.
 
-OK, now test it.
+---
 
-```sh
-pulumi up
+## Redis Caching
+
+Before Hybrid H03, the app used local in-memory caching.
+
+That approach has limitations:
+
+- The cache is lost when the container restarts.
+- Each container would have its own separate cache.
+- It is not ideal for scalable cloud applications.
+
+Hybrid H03 adds Redis caching.
+
+The new application flow is:
+
+```text
+User requests weather data
+↓
+Application checks Redis cache
+↓
+If cached data exists, return cached data
+↓
+If cached data does not exist, call OpenWeather API
+↓
+Store the result in Redis for 10 minutes
+↓
+Return weather data to the user
 ```
 
-**Success !!**
+Redis is useful because it is external to the application container. This makes the cache more reliable and closer to a real cloud architecture.
 
-That feels better :wink:
+---
 
-### Redis - a more robust cache solution
+## Application Code Changes
 
-[Redis](https://redis.io/) is a highly performant in-memory database that supports many use cases. For our purposes, it will act as a results cache for OpenWeather API calls. We can use the "[string](https://redis.io/docs/data-types/strings/)" data type to store key:value pairs where the key is the query string prams from the API call and the value is the returned result. The Redis [set](https://redis.io/commands/set/) command is used to set the current value for a given key. It also takes an optional argument to define an expiry time. When a key's expiry time has been exceeded, Redis will automatically purge the key. This will simplify the look-up logic in our application -- we don't need to check if the cache has expired.
+A Redis client dependency was added:
 
-#### Add dependencies
-
-The application will need a Redis client library to be able to talk to the database. The official [redis](https://github.com/redis/node-redis) client is fast, supports Typescript and promises.
-
-```sh
-npm install redis
+```bash
+npm install redis@4.6.14
 ```
 
-#### Update the application code
+A new Redis connection file was created:
 
-##### 1. Create a database connection and export a reusable client object. Add a new file called `redis-connection.ts` to the `app/data-access` folder.
-
-```ts
-import { createClient } from 'redis'
-
-const url = process.env.REDIS_URL || 'redis://localhost:6379'
-
-export const redis = await createClient({ url })
-  .on('error', (err) => console.error('Redis client connection error', err))
-  .connect()
+```text
+app/data-access/redis-connection.ts
 ```
 
-> [!NOTE]
-> This will default to connecting to the default Redis port (6379) on localhost.
-> We will set the environment variable to the correct value later with Pulumi.
+This file creates a reusable Redis client connection using the `REDIS_URL` environment variable.
 
-##### 2. Modify the _open-weather-service.ts_ module to use the Redis client instead of the simple in-memory cache.
+The weather service file was updated:
 
-```ts
-import { redis } from '../data-access/redis-connection'
-
-const API_KEY = process.env.WEATHER_API_KEY
-const BASE_URL = 'https://api.openweathermap.org/data/2.5/weather'
-const TEN_MINUTES = 1000 * 60 * 10 // in milliseconds
-
-interface FetchWeatherDataParams {
-  lat: number
-  lon: number
-  units: 'standard' | 'metric' | 'imperial'
-}
-export async function fetchWeatherData({
-  lat,
-  lon,
-  units,
-}: FetchWeatherDataParams) {
-  const queryString = `lat=${lat}&lon=${lon}&units=${units}`
-
-  const cacheEntry = await redis.get(queryString)
-  if (cacheEntry) return JSON.parse(cacheEntry)
-
-  const response = await fetch(`${BASE_URL}?${queryString}&appid=${API_KEY}`)
-  const data = await response.text() // avoid an unnecessary extra JSON.stringify
-  await redis.set(queryString, data, { PX: TEN_MINUTES }) // The PX option sets the expiry time
-  return JSON.parse(data)
-}
+```text
+app/api-services/open-weather-service.ts
 ```
 
-##### 3. Test the application changes in your local dev environment.
+The service now checks Redis before calling the OpenWeather API. If weather data already exists in Redis, the app returns the cached data. If not, the app calls OpenWeather and stores the result in Redis.
 
-We ultimately want to deploy this to Azure, but for now you can quickly test the code changes by spinning up a temporary Redis container in your local Docker desktop. In a separate terminal tab, run this command ...
+---
 
-```sh
-docker run -p 6379:6379 -it redis/redis-stack-server:latest
+## Pulumi Infrastructure Changes
+
+The Pulumi infrastructure was updated to create and configure:
+
+- Azure Resource Group
+- Azure Container Registry
+- Azure Cache for Redis
+- Docker image version `v0.3.0`
+- Azure Container Instance
+- Secure environment variables for the container
+
+The container receives these important environment variables:
+
+```text
+WEATHER_API_KEY
+REDIS_URL
 ```
 
-Then in a different terminal tab, you can run the Remix dev server to test the application.
+`WEATHER_API_KEY` is passed from Pulumi secret configuration.
 
-```sh
-npm run dev
+`REDIS_URL` is created from the Azure Redis hostname and Redis access key.
+
+The Pulumi deployment flow is:
+
+```text
+Pulumi code
+↓
+Azure Resource Group
+↓
+Azure Container Registry
+↓
+Docker image build and push
+↓
+Azure Cache for Redis
+↓
+Azure Container Instance
+↓
+Public weather application URL
 ```
 
-> [!TIP]
-> Remember that the local dev server will need the WEATHER_API_KEY environment variable set.
+---
 
-**Success!**
+## Azure Region Issue
 
-OK. If that is all working, you should update the version tag for the app container image.
+During deployment, some Azure regions were blocked by the Azure for Students subscription policy.
 
-```sh
-pulumi config set imageTag "v0.3.0"
+The deployment failed in some regions with this error:
+
+```text
+RequestDisallowedByAzure
 ```
 
-### Update the IaC Definition
+The successful deployment used:
 
-Great! You got the application code updated to use Redis. Now we need to make sure that there is a Redis instance available in the cloud deployment environment. Options?
-
-1. You could add another container instance and run the same Redis container image in it that you used for the local testing. The application container could then talk to it via a private (not internet accessible) IP address.
-
-2. You could use the Azure Cache for Redis managed service. This is more robust and does not require you to manage your own Redis database. It will also support future scaling when we need more than one instance of the application container.
-
-**Let's implement option two.**
-
-> [!TIP]
-> See the [Azure Cache for Redis](https://learn.microsoft.com/en-us/azure/azure-cache-for-redis/) documentation.
-
-For this lab activity you can use the `basic` service tier (SKU) to save cost. For a real application your should choose the `premium` teir or higher.
-
-You will need to use the `cache` sub-module from the [Pulumi azzure-native](https://www.pulumi.com/registry/packages/azure-native/api-docs/cache/redis/#package-details) package -- see the linked docs for more details.
-
-Add this Redis cache definition section near the top of your `infrastructure\index.ts` file -- after the resource group definition. It needs to be defined before the container definition so that you can inject the db conection details into the application container.
-
-```ts
-import * as cache from '@pulumi/azure-native/cache'
-// ... configs and resource group
-
-// Create a managed Redis service
-const redis = new cache.Redis(`${prefixName}-redis`, {
-  name: `${prefixName}-weather-cache`,
-  location: 'westus3',
-  resourceGroupName: resourceGroup.name,
-  enableNonSslPort: true,
-  redisVersion: 'Latest',
-  minimumTlsVersion: '1.2',
-  redisConfiguration: {
-    maxmemoryPolicy: 'allkeys-lru',
-  },
-  sku: {
-    name: 'Basic',
-    family: 'C',
-    capacity: 0,
-  },
-})
+```text
+westus2
 ```
 
-In order to construct the Redis connection string required for the app container's REDIS_URL environment variable, you will need to extract the autogenerated "access key" (password) from the Redis service once it is provisioned. Similar to how we obtained the container registry credentials in the previous lab, the `azure-native.cache` module has a function called `listRedisKeysOutput` that you can use.
+The final deployment also used a unique prefix:
 
-```ts
-// Extract the auth creds from the deployed Redis service
-const redisAccessKey = cache
-  .listRedisKeysOutput({
-    name: redis.name,
-    resourceGroupName: resourceGroup.name,
-  })
-  .apply((keys) => keys.primaryKey)
+```text
+cst8918-h03-ilyas
 ```
 
-Then you can use the `pulumi.interpolate` method to construct the final URL.
+This avoided conflicts with the existing Lab A03 deployment.
 
-> [!TIP]
-> See [Pulumi docs: Working with Outputs and Strings](https://www.pulumi.com/docs/concepts/inputs-outputs/#outputs-and-strings)
+---
 
-```ts
-// Construct the Redis connection string to be passed as an environment variable in the app container
-const redisConnectionString = pulumi.interpolate`rediss://:${redisAccessKey}@${redis.hostName}:${redis.sslPort}`
+## Docker Issue
+
+During deployment, the Docker image build failed at first because Docker Desktop was not running.
+
+Pulumi needed Docker because the infrastructure code builds the application image locally and pushes it to Azure Container Registry.
+
+The deployment flow was:
+
+```text
+Pulumi
+↓
+Docker build
+↓
+Azure Container Registry
+↓
+Azure Container Instance
 ```
 
-Finally, set the `REDIS_URL` environment variable in the container group definition section.
+After Docker Desktop was started and the image build was simplified to use `linux/amd64`, the deployment completed successfully.
 
-```ts
-environmentVariables: [
-  // existing vars ...
-  {
-    name: 'REDIS_URL',
-    value: redisConnectionString,
-  },
-]
+---
+
+## Successful Pulumi Outputs
+
+The final Pulumi deployment completed successfully with these outputs:
+
+```text
+hostname: cst8918-h03-ilyas.westus2.azurecontainer.io
+ip: 4.149.195.19
+redisHostName: cst8918-h03-ilyas-redis.redis.cache.windows.net
+url: http://cst8918-h03-ilyas.westus2.azurecontainer.io:80
 ```
 
-#### Time to deploy!
+---
 
-```sh
-pulumi up
+## Final Deployment URL
+
+```text
+http://cst8918-h03-ilyas.westus2.azurecontainer.io:80
 ```
 
-If the plan preview throws any errors, recheck your code for typos. Otherwise, after about 10 - 12 minutes you should have a successful deploy. Using your browser, open the application URL that Pulumi output in the terminal to verify everything is working.
+---
 
-You can also inspect the deployed resources from the Azure console.
+## Screenshot Evidence
 
-Congratulations!!
+The Pulumi deployment output screenshot was saved as:
 
-## Demo / Submit
-
-Take a screenshot of your terminal showing the output of the `pulumi up` command. Add that screenshot to the root of your project folder with the name `pulumi-output.png`.
-
-When you have completed this activity, make sure that you have committed all of your changes with git, and pushed your commits up to GitHub. Remember, this should be on a branch called `hybrid-h03` and there should be commits from both partners.
-
-Submit a link to your GitHub repo for this assignment in Brightspace.
-
-## Clean-up!
-
-When you are all done, don't forget to clean up the unneeded Azure resources.
-
-```sh
-pulumi destroy
+```text
+pulumi-output.png
 ```
 
-> [!CAUTION]
-> Failing to do this may exceed your Azure subscription limit, resulting in academic penalties!
+This screenshot shows the successful deployment outputs, including the hostname, IP address, Redis hostname, and application URL.
+
+---
+
+## What I Learned
+
+This lab helped me understand how Git, Pulumi, Docker, Azure, and Redis work together in a DevOps workflow.
+
+The main lessons were:
+
+- Git branches help separate Part One and Part Two work.
+- Pulumi allows cloud infrastructure to be written and deployed as code.
+- Secrets should not be hardcoded in source code.
+- Pulumi secrets can store sensitive values securely.
+- Redis can be used as an external cache for cloud applications.
+- Azure region policies can block deployments, so region selection matters.
+- Docker Desktop must be running because Pulumi builds and pushes the Docker image.
+- `pulumi up` applies infrastructure changes to Azure.
+- Successful Pulumi outputs are important evidence for lab submission.
+
+---
+
+## Summary
+
+Hybrid H03 improved the original Lab A03 deployment by adding secure secret management and Redis caching.
+
+The final architecture is:
+
+```text
+User
+↓
+Azure Container Instance
+↓
+Weather App Container
+↓
+Redis Cache
+↓
+OpenWeather API
+```
+
+Pulumi manages the Azure infrastructure, Docker builds and pushes the image, and Azure Container Instance runs the application using secure environment variables.
+
+The final result is a more realistic cloud deployment because the application now uses Infrastructure as Code, encrypted secrets, container deployment, and external Redis caching.
+
+
+- AI is used for documentation 
