@@ -141,3 +141,11 @@ tested public application
 ```
 
 The most important lesson is that infrastructure changes should be written as code, committed to Git, reviewed through branches, and deployed in a controlled way.
+
+
+## Lab A03 Deployment Screenshot
+
+![Lab A03 running weather app](./lab-a03.png)
+
+
+- AI is used for Documentation 
